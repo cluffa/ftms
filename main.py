@@ -3,10 +3,15 @@ import logging
 import sys
 import struct
 import time
+import os
 
-from bleak import BleakServer, BleakGATTCharacteristic, BleakError
+from bumble.device import Device, Peer
+from bumble.host import Host
+from bumble.gatt import Service, Characteristic, CharacteristicValue
+from bumble.core import AdvertisingData
+from bumble.transport import open_transport_or_link
 
-# --- Configuration ---
+# --- Configuration --- (Keep existing UUIDs, DEVICE_NAME, constants, FTMS_FEATURES, ranges, etc.)
 # Official FTMS UUIDs
 FTMS_SERVICE_UUID = "00001826-0000-1000-8000-00805f9b34fb"
 CONTROL_POINT_CHAR_UUID = "00002AD9-0000-1000-8000-00805f9b34fb"
@@ -38,21 +43,15 @@ CP_STOP_OR_PAUSE = 0x08
 
 # Feature flags (16 bytes/128 bits)
 FTMS_FEATURES = bytearray([
-    0x54, 0x08, 0x00, 0x00,  # Fitness Machine Features (bits 0-31)
-    # - Inclination supported [bit 6]
-    # - Resistance level supported [bit 2]
-    # - Power measurement supported [bit 14]
-    # - Heart rate measurement supported [bit 16]
-    0xA2, 0x00, 0x00, 0x00,  # Target Setting Features (bits 32-63)
-    # - Resistance level target setting supported [bit 1]
-    # - Power target setting supported [bit 7]
-    0x00, 0x00, 0x00, 0x00,  # bits 64-95
-    0x00, 0x00, 0x00, 0x00   # bits 96-127
+    0x54, 0x08, 0x00, 0x00,  # Fitness Machine Features
+    0xA2, 0x00, 0x00, 0x00,  # Target Setting Features
+    0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00
 ])
 
 # Supported ranges
-RESISTANCE_RANGE = bytearray(struct.pack("<hhh", 0, 3000, 10))  # Min: 0, Max: 3000, Increment: 10 (0.1 units)
-POWER_RANGE = bytearray(struct.pack("<hhh", 0, 2000, 1))  # Min: 0W, Max: 2000W, Increment: 1W
+RESISTANCE_RANGE = bytearray(struct.pack("<hhh", 0, 3000, 10))
+POWER_RANGE = bytearray(struct.pack("<hhh", 0, 2000, 1))
 
 # Training status values
 STATUS_IDLE = 0x01
@@ -63,268 +62,351 @@ STATUS_COMPLETED = 0x04
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Global state
-current_resistance = 0  # In 0.1 units (0-3000)
-current_power = 100     # In watts (0-2000)
-current_speed = 1000    # In 0.01 km/h units (10 km/h)
-current_cadence = 140   # In 0.5 RPM units (70 RPM)
-current_hr = 0          # Heart rate, if available
+# --- Global State & Connection Management ---
+# Store connection-specific state here
+# Key: connection handle or object, Value: dict containing state like 'has_control'
+connection_states = {}
+
+# References to characteristics for updates/indications
+ftms_service_object = None
+indoor_bike_data_char = None
+training_status_char = None
+control_point_char = None
+
+# Global simulation state (as before)
+current_resistance = 0
+current_power = 100
+current_speed = 1000
+current_cadence = 140
+current_hr = 0
 training_status = STATUS_IDLE
-has_control = False     # Whether client has control
-client_writes_enabled = True  # Whether client writes are permitted
 
-# Control point response queue
-control_point_response = None
-control_point_char = None  # Will be populated when characteristic is created
+# --- Bumble Specific Functions ---
 
-async def send_control_point_response(request_op_code, response_code, values=None):
-    """Sends a response to a control point request via indication."""
+async def send_control_point_response(connection, request_op_code, response_code, values=None):
+    """Sends a response to a control point request via indication (Bumble)."""
     global control_point_char
-    
-    if control_point_char is None:
-        logger.error("Control point characteristic not initialized")
+    if control_point_char is None or connection is None:
+        logger.error("Control point characteristic or connection not available")
         return
-    
+
     # Format is: Response Code (0x80) + Request Op Code + Result Code + [Values]
     response = bytearray([0x80, request_op_code, response_code])
     if values:
         response.extend(values)
-    
-    logger.info(f"Sending control point response: {response.hex()}")
-    await control_point_char.service.server.indicate(control_point_char, response)
+
+    logger.info(f"Sending control point response to {connection.peer_address}: {response.hex()}")
+    try:
+        # Use the connection object to indicate
+        await connection.indicate_characteristic(control_point_char, response)
+    except Exception as e:
+        logger.error(f"Failed to send indication: {e}")
 
 def generate_indoor_bike_data():
     """Generates a simulated indoor bike data packet according to FTMS spec."""
     # Flags: Speed present, Cadence present, Power present, HR present
-    flags = 0b00001111
-    
-    # Format according to FTMS spec:
-    # [Flags (2 bytes)][Speed (2 bytes)][Cadence (2 bytes)][Power (2 bytes)][HR (1 byte)]
-    return struct.pack("<HHHHb", 
-                      flags,
-                      current_speed,  # Speed in 0.01 km/h units
-                      current_cadence,  # Cadence in 0.5 RPM units
-                      current_power,  # Power in watts
-                      current_hr if current_hr else 0)
+    # Adjust flags based on actual available data if needed
+    flags = 0b00000000
+    data_list = []
 
-async def update_bike_data(indoor_bike_data_char):
-    """Updates the indoor bike data characteristic with simulated values."""
-    if not indoor_bike_data_char:
+    # Speed
+    flags |= (1 << 1) # Instantaneous Speed present
+    data_list.append(struct.pack("<H", current_speed))
+
+    # Cadence
+    flags |= (1 << 2) # Average Cadence present (or Instantaneous if preferred)
+    data_list.append(struct.pack("<H", current_cadence))
+
+    # Power
+    flags |= (1 << 5) # Instantaneous Power present
+    data_list.append(struct.pack("<h", current_power)) # Power is signed
+
+    # HR (Optional)
+    if current_hr > 0:
+        flags |= (1 << 4) # Heart Rate present
+        data_list.append(struct.pack("<B", current_hr))
+
+    # Combine flags and data
+    packet = struct.pack("<H", flags) + b''.join(data_list)
+    return packet
+
+
+async def update_bike_data(device):
+    """Updates the indoor bike data characteristic for subscribed clients."""
+    global indoor_bike_data_char
+    if not indoor_bike_data_char or not device:
         return
-        
+
     try:
-        # Simulate changes in resistance affecting power and speed
-        # In a real implementation, this would come from real sensors
+        # Simulate changes (as before, or use real sensor data)
         global current_power, current_speed
-        
-        # Generate data packet and notify clients
+        # Simplified update logic
+        # current_speed = max(500, min(4000, int(1000 + current_resistance * 0.5)))
+        # current_power = max(50, min(2000, int(100 + (current_resistance / 10))))
+
         data = generate_indoor_bike_data()
-        await indoor_bike_data_char.service.server.notify(indoor_bike_data_char, data)
+
+        # Notify all subscribed connections
+        for connection in device.connections.values():
+             if connection.is_subscribed(indoor_bike_data_char):
+                logger.debug(f"Notifying bike data to {connection.peer_address}")
+                await connection.notify_characteristic(indoor_bike_data_char, data)
+
         logger.debug(f"Updated bike data: speed={current_speed/100}km/h, power={current_power}W, cadence={current_cadence/2}RPM")
+
     except Exception as e:
         logger.error(f"Error updating bike data: {e}")
 
-# --- Control Point Handler ---
-async def handle_control_point_write(characteristic: BleakGATTCharacteristic, data: bytearray):
-    """Handles writes to the control point characteristic."""
-    global has_control, current_resistance, current_power, training_status
-    
-    logger.info(f"Received control point command: {data.hex()}")
-    
-    if not data:
+# --- Control Point Handler (Bumble) ---
+async def on_control_point_write(connection, value):
+    """Handles writes to the control point characteristic (Bumble)."""
+    global current_resistance, current_power, training_status
+
+    logger.info(f"Received control point command from {connection.peer_address}: {value.hex()}")
+
+    if not value:
         logger.warning("Received empty data on control point.")
         return
 
-    op_code = data[0]
+    op_code = value[0]
     logger.info(f"  Op Code: {op_code}")
 
-    # Handle specific opcodes as defined in FTMS specification
+    # Get or initialize state for this connection
+    if connection not in connection_states:
+        connection_states[connection] = {'has_control': False}
+    conn_state = connection_states[connection]
+
     try:
         if op_code == CP_REQUEST_CONTROL:
-            has_control = True
-            logger.info("Client requested control - granted")
-            await send_control_point_response(CP_REQUEST_CONTROL, RESPONSE_SUCCESS)
-            
+            conn_state['has_control'] = True
+            logger.info(f"Client {connection.peer_address} requested control - granted")
+            await send_control_point_response(connection, CP_REQUEST_CONTROL, RESPONSE_SUCCESS)
+
         elif op_code == CP_RESET:
+            # Reset global state or connection-specific state as appropriate
             current_resistance = 0
             current_power = 100
+            training_status = STATUS_IDLE # Reset global training status
+            # Reset control for this connection? FTMS spec might clarify
+            # conn_state['has_control'] = False
             logger.info("Received reset command")
-            await send_control_point_response(CP_RESET, RESPONSE_SUCCESS)
-            
+            await send_control_point_response(connection, CP_RESET, RESPONSE_SUCCESS)
+            # Potentially update Training Status char for all subscribed clients
+
         elif op_code == CP_SET_TARGET_RESISTANCE:
-            if not has_control:
-                logger.warning("Client attempted to set resistance without control")
-                await send_control_point_response(CP_SET_TARGET_RESISTANCE, RESPONSE_CONTROL_NOT_PERMITTED)
+            if not conn_state.get('has_control', False):
+                logger.warning(f"Client {connection.peer_address} attempted to set resistance without control")
+                await send_control_point_response(connection, CP_SET_TARGET_RESISTANCE, RESPONSE_CONTROL_NOT_PERMITTED)
                 return
-                
-            if len(data) < 3:  # Opcode + 2 bytes for sint16
+
+            if len(value) < 3: # Opcode + 2 bytes for sint16
                 logger.warning("Invalid resistance data format")
-                await send_control_point_response(CP_SET_TARGET_RESISTANCE, RESPONSE_INVALID_PARAMETER)
+                await send_control_point_response(connection, CP_SET_TARGET_RESISTANCE, RESPONSE_INVALID_PARAMETER)
                 return
-                
-            # Parse resistance value (signed 16-bit integer, little-endian)
-            resistance = struct.unpack("<h", data[1:3])[0]
-            logger.info(f"Setting resistance level to {resistance/10.0}%")
-            
-            if resistance < 0 or resistance > 3000:  # Check against our defined range
-                logger.warning(f"Resistance value {resistance} out of range")
-                await send_control_point_response(CP_SET_TARGET_RESISTANCE, RESPONSE_INVALID_PARAMETER)
+
+            resistance = struct.unpack("<h", value[1:3])[0] # Resistance is sint16 in 0.1 units
+            logger.info(f"Setting resistance level to {resistance / 10.0}") # Spec says unitless, often interpreted as %
+
+            min_res, max_res, _ = struct.unpack("<hhh", RESISTANCE_RANGE)
+            if resistance < min_res or resistance > max_res:
+                logger.warning(f"Resistance value {resistance} out of range ({min_res}-{max_res})")
+                await send_control_point_response(connection, CP_SET_TARGET_RESISTANCE, RESPONSE_INVALID_PARAMETER)
                 return
-                
+
             current_resistance = resistance
-            # Here you would add code to physically change resistance
-            # Update power and speed based on resistance change (simplified model)
-            current_power = max(50, min(2000, int(100 + (resistance / 10))))
-            
-            await send_control_point_response(CP_SET_TARGET_RESISTANCE, RESPONSE_SUCCESS)
-            
+            # Add code here to physically change resistance if applicable
+            # Update power/speed based on new resistance (simulation)
+            current_power = max(50, min(2000, int(100 + (resistance / 10)))) # Example update
+
+            await send_control_point_response(connection, CP_SET_TARGET_RESISTANCE, RESPONSE_SUCCESS)
+
         elif op_code == CP_SET_TARGET_POWER:
-            if not has_control:
-                logger.warning("Client attempted to set power without control")
-                await send_control_point_response(CP_SET_TARGET_POWER, RESPONSE_CONTROL_NOT_PERMITTED)
+            if not conn_state.get('has_control', False):
+                logger.warning(f"Client {connection.peer_address} attempted to set power without control")
+                await send_control_point_response(connection, CP_SET_TARGET_POWER, RESPONSE_CONTROL_NOT_PERMITTED)
                 return
-                
-            if len(data) < 3:  # Opcode + 2 bytes for sint16
+
+            if len(value) < 3: # Opcode + 2 bytes for sint16
                 logger.warning("Invalid power data format")
-                await send_control_point_response(CP_SET_TARGET_POWER, RESPONSE_INVALID_PARAMETER)
+                await send_control_point_response(connection, CP_SET_TARGET_POWER, RESPONSE_INVALID_PARAMETER)
                 return
-                
-            # Parse power value (signed 16-bit integer, little-endian)
-            power = struct.unpack("<h", data[1:3])[0]
+
+            power = struct.unpack("<h", value[1:3])[0] # Power is sint16 in Watts
             logger.info(f"Setting target power to {power}W")
-            
-            if power < 0 or power > 2000:  # Check against our defined range
-                logger.warning(f"Power value {power} out of range")
-                await send_control_point_response(CP_SET_TARGET_POWER, RESPONSE_INVALID_PARAMETER)
+
+            min_pwr, max_pwr, _ = struct.unpack("<hhh", POWER_RANGE)
+            if power < min_pwr or power > max_pwr:
+                logger.warning(f"Power value {power} out of range ({min_pwr}-{max_pwr})")
+                await send_control_point_response(connection, CP_SET_TARGET_POWER, RESPONSE_INVALID_PARAMETER)
                 return
-                
+
             current_power = power
-            # Here you would add code to physically adjust to maintain target power
-            
-            await send_control_point_response(CP_SET_TARGET_POWER, RESPONSE_SUCCESS)
-            
+            # Add code here to adjust resistance to meet target power if applicable
+
+            await send_control_point_response(connection, CP_SET_TARGET_POWER, RESPONSE_SUCCESS)
+
         elif op_code == CP_START_OR_RESUME:
             logger.info("Starting/Resuming training session")
             training_status = STATUS_ACTIVE
-            await send_control_point_response(CP_START_OR_RESUME, RESPONSE_SUCCESS)
-            
+            await send_control_point_response(connection, CP_START_OR_RESUME, RESPONSE_SUCCESS)
+            # Update Training Status char for all subscribed clients
+            # await update_training_status_char(device, training_status) # Need device ref
+
         elif op_code == CP_STOP_OR_PAUSE:
-            if len(data) < 2:
+            if len(value) < 2:
                 logger.warning("Invalid stop/pause data format")
-                await send_control_point_response(CP_STOP_OR_PAUSE, RESPONSE_INVALID_PARAMETER)
+                await send_control_point_response(connection, CP_STOP_OR_PAUSE, RESPONSE_INVALID_PARAMETER)
                 return
-                
-            stop_or_pause = data[1]
+
+            stop_or_pause = value[1]
+            new_status = training_status
             if stop_or_pause == 0x01:  # Stop
                 logger.info("Stopping training session")
-                training_status = STATUS_IDLE
+                new_status = STATUS_IDLE
+                # Optionally revoke control on stop
+                # conn_state['has_control'] = False
             elif stop_or_pause == 0x02:  # Pause
                 logger.info("Pausing training session")
-                training_status = STATUS_PAUSED
+                new_status = STATUS_PAUSED
             else:
                 logger.warning(f"Invalid stop/pause parameter: {stop_or_pause}")
-                await send_control_point_response(CP_STOP_OR_PAUSE, RESPONSE_INVALID_PARAMETER)
+                await send_control_point_response(connection, CP_STOP_OR_PAUSE, RESPONSE_INVALID_PARAMETER)
                 return
-                
-            await send_control_point_response(CP_STOP_OR_PAUSE, RESPONSE_SUCCESS)
-            
+
+            training_status = new_status
+            await send_control_point_response(connection, CP_STOP_OR_PAUSE, RESPONSE_SUCCESS)
+            # Update Training Status char for all subscribed clients
+            # await update_training_status_char(device, training_status) # Need device ref
+
         else:
             logger.warning(f"Unsupported op code: {op_code}")
-            await send_control_point_response(op_code, RESPONSE_NOT_SUPPORTED)
-            
+            await send_control_point_response(connection, op_code, RESPONSE_NOT_SUPPORTED)
+
     except Exception as e:
         logger.error(f"Error handling control point command: {e}", exc_info=True)
         try:
-            await send_control_point_response(op_code, RESPONSE_OPERATION_FAILED)
-        except:
-            logger.error("Failed to send error response")
+            # Attempt to send a generic failure response
+            await send_control_point_response(connection, op_code, RESPONSE_OPERATION_FAILED)
+        except Exception as inner_e:
+            logger.error(f"Failed to send error response: {inner_e}")
 
-# --- Main Server Logic ---
-async def run_server():
-    """Runs the BLE GATT server."""
-    global control_point_char
-    
-    logger.info(f"Starting GATT server as '{DEVICE_NAME}'")
-    logger.info(f"Service UUID: {FTMS_SERVICE_UUID}")
 
-    try:
-        async with BleakServer(DEVICE_NAME) as server:
-            logger.info("Server started. Advertising...")
+# --- Main Server Logic (Bumble) ---
+async def main():
+    global ftms_service_object, indoor_bike_data_char, training_status_char, control_point_char
 
-            # Add the FTMS service
-            await server.add_service(uuid=FTMS_SERVICE_UUID, is_primary=True)
-            
-            # Add the FTMS Feature characteristic (mandatory, read-only)
-            feature_char = await server.add_characteristic(
-                uuid=FEATURE_CHAR_UUID,
-                service_uuid=FTMS_SERVICE_UUID,
-                properties=BleakGATTCharacteristic.READ,
-                value=FTMS_FEATURES,
-            )
-            logger.info(f"Added Feature characteristic: {FEATURE_CHAR_UUID}")
-            
-            # Add Supported Resistance Level Range characteristic (read-only)
-            resistance_range_char = await server.add_characteristic(
-                uuid=SUPPORTED_RESISTANCE_LEVEL_RANGE_CHAR_UUID,
-                service_uuid=FTMS_SERVICE_UUID,
-                properties=BleakGATTCharacteristic.READ,
-                value=RESISTANCE_RANGE,
-            )
-            logger.info(f"Added Resistance Range characteristic: {SUPPORTED_RESISTANCE_LEVEL_RANGE_CHAR_UUID}")
-            
-            # Add Supported Power Range characteristic (read-only)
-            power_range_char = await server.add_characteristic(
-                uuid=SUPPORTED_POWER_RANGE_CHAR_UUID,
-                service_uuid=FTMS_SERVICE_UUID,
-                properties=BleakGATTCharacteristic.READ,
-                value=POWER_RANGE,
-            )
-            logger.info(f"Added Power Range characteristic: {SUPPORTED_POWER_RANGE_CHAR_UUID}")
-            
-            # Add Indoor Bike Data characteristic (notify-only)
-            indoor_bike_data_char = await server.add_characteristic(
-                uuid=INDOOR_BIKE_DATA_CHAR_UUID,
-                service_uuid=FTMS_SERVICE_UUID,
-                properties=BleakGATTCharacteristic.NOTIFY,
-            )
-            logger.info(f"Added Indoor Bike Data characteristic: {INDOOR_BIKE_DATA_CHAR_UUID}")
-            
-            # Add Training Status characteristic (read, notify)
-            training_status_char = await server.add_characteristic(
-                uuid=TRAINING_STATUS_CHAR_UUID,
-                service_uuid=FTMS_SERVICE_UUID,
-                properties=BleakGATTCharacteristic.READ | BleakGATTCharacteristic.NOTIFY,
-                value=bytearray([training_status]),  # Initial value
-            )
-            logger.info(f"Added Training Status characteristic: {TRAINING_STATUS_CHAR_UUID}")
-            
-            # Add Control Point characteristic (write, indicate)
-            control_point_char = await server.add_characteristic(
-                uuid=CONTROL_POINT_CHAR_UUID,
-                service_uuid=FTMS_SERVICE_UUID,
-                properties=BleakGATTCharacteristic.WRITE | BleakGATTCharacteristic.INDICATE,
-                write_callback=handle_control_point_write,
-            )
-            logger.info(f"Added Control Point characteristic: {CONTROL_POINT_CHAR_UUID}")
+    logger.info("Starting Bumble FTMS Server...")
+    # TODO: Replace 'hci-socket:0' with the correct transport for your system
+    # Common options: 'hci-socket:0', 'usb:0', 'pty', 'tcp-client:localhost:6789', etc.
+    transport_name = "hci-socket:0"
+    logger.info(f"Using transport: {transport_name}")
 
-            logger.info("Services and characteristics added. Waiting for connections...")
-            
-            # Start periodic bike data updates
+    async with await open_transport_or_link(transport_name) as (hci_source, hci_sink):
+        device = Device(name=DEVICE_NAME, address='random', host=Host(hci_source, hci_sink))
+
+        # --- Define FTMS Service and Characteristics ---
+        feature_char = Characteristic(
+            FEATURE_CHAR_UUID,
+            Characteristic.Properties.READ,
+            Characteristic.Permissions.READ_REQUIRES_AUTHENTICATION, # Or READABLE if no auth needed
+            FTMS_FEATURES # Initial value
+        )
+
+        resistance_range_char = Characteristic(
+            SUPPORTED_RESISTANCE_LEVEL_RANGE_CHAR_UUID,
+            Characteristic.Properties.READ,
+            Characteristic.Permissions.READABLE,
+            RESISTANCE_RANGE
+        )
+
+        power_range_char = Characteristic(
+            SUPPORTED_POWER_RANGE_CHAR_UUID,
+            Characteristic.Properties.READ,
+            Characteristic.Permissions.READABLE,
+            POWER_RANGE
+        )
+
+        # Store refs to chars needed for updates/indications
+        indoor_bike_data_char = Characteristic(
+            INDOOR_BIKE_DATA_CHAR_UUID,
+            Characteristic.Properties.NOTIFY,
+            Characteristic.Permissions.READABLE # Notify doesn't have separate permission
+        )
+
+        training_status_char = Characteristic(
+            TRAINING_STATUS_CHAR_UUID,
+            Characteristic.Properties.READ | Characteristic.Properties.NOTIFY,
+            Characteristic.Permissions.READABLE,
+            bytes([training_status]) # Initial value
+        )
+
+        control_point_char = Characteristic(
+            CONTROL_POINT_CHAR_UUID,
+            Characteristic.Properties.WRITE | Characteristic.Properties.INDICATE,
+            Characteristic.Permissions.WRITEABLE | Characteristic.Permissions.READABLE, # Indicate needs readable? Check spec/Bumble docs
+            write_handler=on_control_point_write # Assign the write handler
+        )
+
+        # Create the FTMS Service
+        ftms_service_object = Service(
+            FTMS_SERVICE_UUID,
+            [
+                feature_char,
+                resistance_range_char,
+                power_range_char,
+                indoor_bike_data_char,
+                training_status_char,
+                control_point_char
+            ],
+            primary=True
+        )
+
+        # Add the service to the device's GATT server
+        device.add_service(ftms_service_object)
+
+        # Set advertising data
+        advertisement = bytes(AdvertisingData([
+            (AdvertisingData.COMPLETE_LOCAL_NAME, bytes(DEVICE_NAME, 'utf-8')),
+            (AdvertisingData.INCOMPLETE_LIST_OF_128_BIT_SERVICE_CLASS_UUIDS, bytes.fromhex(FTMS_SERVICE_UUID.replace('-', ''))),
+            (AdvertisingData.FLAGS, bytes([0x06])) # LE General Discoverable Mode, BR/EDR Not Supported
+        ]))
+        await device.set_advertising_data(advertisement)
+
+        # Debug: Print services and characteristics
+        for service in device.gatt_server.services:
+            logger.info(f"Service {service.uuid}:")
+            for char in service.characteristics:
+                logger.info(f"  Characteristic {char.uuid} Properties: {char.properties} Permissions: {char.permissions}")
+
+
+        # Start advertising
+        await device.start_advertising(auto_restart=True)
+        logger.info(f"Advertising as '{DEVICE_NAME}'...")
+
+        # Start periodic updates
+        async def periodic_update_task():
             while True:
-                await update_bike_data(indoor_bike_data_char)
-                await asyncio.sleep(1.0)  # Update every second
+                await update_bike_data(device)
+                # Update training status char if needed
+                # await update_training_status_char(device, training_status)
+                await asyncio.sleep(1.0)
 
-    except BleakError as e:
-        logger.error(f"Bleak error: {e}")
-    except Exception as e:
-        logger.error(f"An unexpected error occurred: {e}", exc_info=True)
-    finally:
-        logger.info("Server stopped.")
+        update_task = asyncio.create_task(periodic_update_task())
+
+        # Keep the server running until interrupted
+        await asyncio.get_running_loop().create_future()
+
+        # Cleanup (though create_future() runs forever unless cancelled)
+        update_task.cancel()
+        await device.stop_advertising()
 
 
 if __name__ == "__main__":
     try:
-        asyncio.run(run_server())
+        asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Server stopped by user.")
+    except Exception as e:
+        logger.error(f"An unexpected error occurred: {e}", exc_info=True)
+    finally:
         sys.exit(0)

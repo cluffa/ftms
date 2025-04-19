@@ -6,5 +6,6 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "bleak>=0.22.3",
+    "bumble>=0.0.209",
     "pyftms>=0.4.15",
 ]
