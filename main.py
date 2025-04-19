@@ -292,17 +292,19 @@ async def on_control_point_write(connection, value):
 
 
 # --- Main Server Logic (Bumble) ---
-async def main():
-    global ftms_service_object, indoor_bike_data_char, training_status_char, control_point_char
+async def run_server():
+    global control_point_char
 
-    logger.info("Starting Bumble FTMS Server...")
-    # TODO: Replace 'hci-socket:0' with the correct transport for your system
-    # Common options: 'hci-socket:0', 'usb:0', 'pty', 'tcp-client:localhost:6789', etc.
-    transport_name = "hci-socket:0"
+    logger.info(f"Starting GATT server as '{DEVICE_NAME}'")
+    logger.info(f"Service UUID: {FTMS_SERVICE_UUID}")
+
+    # Define transport to use 'hci' for direct hardware access
+    transport_name = "hci"
     logger.info(f"Using transport: {transport_name}")
 
     async with await open_transport_or_link(transport_name) as (hci_source, hci_sink):
-        device = Device(name=DEVICE_NAME, address='random', host=Host(hci_source, hci_sink))
+        # Use a valid static random address format instead of 'random'
+        device = Device(name=DEVICE_NAME, address='F0:F1:F2:F3:F4:F5', host=Host(hci_source, hci_sink))
 
         # --- Define FTMS Service and Characteristics ---
         feature_char = Characteristic(
@@ -343,9 +345,10 @@ async def main():
         control_point_char = Characteristic(
             CONTROL_POINT_CHAR_UUID,
             Characteristic.Properties.WRITE | Characteristic.Properties.INDICATE,
-            Characteristic.Permissions.WRITEABLE | Characteristic.Permissions.READABLE, # Indicate needs readable? Check spec/Bumble docs
-            write_handler=on_control_point_write # Assign the write handler
+            Characteristic.Permissions.WRITEABLE | Characteristic.Permissions.READABLE # Indicate needs readable? Check spec/Bumble docs
         )
+        # Assign the write handler after initialization
+        control_point_char.write_value = on_control_point_write
 
         # Create the FTMS Service
         ftms_service_object = Service(
@@ -370,14 +373,14 @@ async def main():
             (AdvertisingData.INCOMPLETE_LIST_OF_128_BIT_SERVICE_CLASS_UUIDS, bytes.fromhex(FTMS_SERVICE_UUID.replace('-', ''))),
             (AdvertisingData.FLAGS, bytes([0x06])) # LE General Discoverable Mode, BR/EDR Not Supported
         ]))
-        await device.set_advertising_data(advertisement)
+        # Assign directly to the attribute instead of calling a method
+        device.advertising_data = advertisement
 
         # Debug: Print services and characteristics
         for service in device.gatt_server.services:
             logger.info(f"Service {service.uuid}:")
             for char in service.characteristics:
                 logger.info(f"  Characteristic {char.uuid} Properties: {char.properties} Permissions: {char.permissions}")
-
 
         # Start advertising
         await device.start_advertising(auto_restart=True)
@@ -403,7 +406,7 @@ async def main():
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        asyncio.run(run_server())
     except KeyboardInterrupt:
         logger.info("Server stopped by user.")
     except Exception as e:
